@@ -51,3 +51,39 @@ jobs:
 
       - name: unit + e2e tests
         run: npm test
+
+  # 插件的主战场是 Windows（ddagrab/gdigrab/dshow、pythonw 悬浮窗、WASAPI 回环），
+  # 但以前 CI 只跑 ubuntu —— pid 回收误杀、rename EPERM、spawn ENOENT 崩宿主这类
+  # 只在 Windows 上出事的坑，没有一条能被测出来。
+  test-windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: isolate DSH_HOME
+        # job 级 env 用不了 runner 上下文（见上面 ubuntu job 的注释），只能在 step 里写进 GITHUB_ENV
+        shell: pwsh
+        run: echo "DSH_HOME=$env:RUNNER_TEMP\dsh-home" >> $env:GITHUB_ENV
+
+      - name: install ffmpeg
+        shell: pwsh
+        run: |
+          if (Get-Command ffmpeg -ErrorAction SilentlyContinue) { ffmpeg -version | Select-Object -First 1; exit 0 }
+          choco install ffmpeg -y --no-progress
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Import-Module "$env:ChocolateyInstall\helpers\chocolateyProfile.psm1"
+          refreshenv
+          ffmpeg -version | Select-Object -First 1
+          # 后面的 step 是新进程：把 choco 的 shim 目录显式加进 PATH
+          echo "$env:ChocolateyInstall\bin" >> $env:GITHUB_PATH
+
+      - name: syntax check
+        run: npm run check:syntax
+
+      - name: unit + e2e tests
+        run: npm test

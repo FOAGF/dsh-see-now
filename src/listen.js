@@ -43,6 +43,7 @@ import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { LISTEN_DEFAULTS, PREFER_KEYS } from './tuning.js';
+import { pyLauncherPythons } from './window.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const LISTEN_SCRIPT = join(HERE, '..', 'examples', 'floating-chat', 'listen.py');
@@ -419,22 +420,36 @@ export async function ensureService(cfg, { log = () => {}, waitMs = 60_000 } = {
   const env = { ...process.env };
   const idleMs = Number(cfg?.manage?.idleMs);
   if (Number.isFinite(idleMs) && idleMs > 0) env.ASR_IDLE_EXIT_S = String(idleMs / 1000);
+  /**
+   * **spawn 失败是异步的**：exe 不存在（ENOENT）不会被下面的 try 接住，而是在下一拍
+   * 以 `'error'` 事件发出来 —— 没人监听就是 uncaught，**整个宿主进程直接退出**。
+   * Windows 上最常见：`manage.start: ["python", ...]`，而 python.org 默认安装不进 PATH。
+   */
+  let spawnErr = null;
   try {
     // 脚本目录当 cwd：很多服务按相对路径找模型
     const cwd = args[0] ? dirname(args[0]) : undefined;
     const child = spawn(exe, args, {
       detached: true, stdio: 'ignore', windowsHide: true, env, ...(cwd ? { cwd } : {}),
     });
+    child.once('error', (e) => {
+      spawnErr = e;
+      log(`转写服务起不来：${e?.code ?? e?.message ?? e}（${exe}）`);
+    });
     child.unref();
   } catch (e) {
     return { ok: false, reason: `起不来：${e?.message ?? e}` };
   }
 
+  const spawnFailed = () => ({ ok: false, reason: `起不来：${spawnErr?.code ?? spawnErr?.message ?? spawnErr}（${exe}）` });
   const until = Date.now() + waitMs;
   while (Date.now() < until) {
-    await sleep(1000);
+    // 短步长先睡：spawn 的 'error' 在下一拍就到，没必要让用户白等满 1 秒
+    for (let i = 0; i < 10 && !spawnErr; i += 1) await sleep(100);
+    if (spawnErr) return spawnFailed();
     if (await probeService(cfg.baseUrl)) return { ok: true, waitedMs: waitMs - (until - Date.now()) };
   }
+  if (spawnErr) return spawnFailed();
   return { ok: false, reason: `等了 ${Math.round(waitMs / 1000)} 秒还没就绪` };
 }
 
@@ -563,7 +578,10 @@ export function findListenPython({ env = process.env } = {}) {
     cfg.listenPython,
     cfg.python,
     env.DSH_FLOAT_PYTHON,
-    ...(process.platform === 'win32' ? ['python.exe', 'pythonw.exe'] : ['python3', 'python']),
+    ...(process.platform === 'win32'
+      // `py` 启动器兜底：python.org 默认安装不进 PATH（见 window.js 的 pyLauncherPythons）
+      ? ['python.exe', 'pythonw.exe', ...pyLauncherPythons().slice().reverse()]
+      : ['python3', 'python']),
   ].filter(Boolean);
   for (const py of [...new Set(list)]) {
     if (canListen(py)) return py;
@@ -1003,8 +1021,10 @@ export function createListener({
         '--silence', String(cfg.silence),
         '--max-seg', String(cfg.maxSeg),
         ...(cfg.live ? ['--live-min', String(cfg.liveMin), '--live-step', String(cfg.liveStep)] : ['--live', '0']),
+        // 收工靠关 stdin（见 stop()）：Windows 的 kill() 是 TerminateProcess，SIGTERM handler 不会跑
+        '--stop-on-eof',
       ], {
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: ['pipe', 'pipe', 'pipe'],
         windowsHide: true,
         env: { ...env, DSH_VIDEO_CACHE_DIR: join(dshHome(env), 'see-now') },
       });
@@ -1023,7 +1043,21 @@ export function createListener({
       const s = String(d).trim();
       if (s) log(`[listen] ${s.slice(-400)}`);
     });
-    child.on('exit', (code) => {
+    const proc = child;
+    // stdin 只用来发"该收工了"（EOF）；对面先退的话写端会 EPIPE，吞掉
+    proc.stdin?.on('error', () => {});
+    // spawn 失败（ENOENT / EACCES / 杀软拦截）是异步 'error'：不监听就是 uncaught，宿主直接退
+    proc.on('error', (e) => {
+      log(`[listen] 采集进程起不来：${e?.code ?? e?.message ?? e}`);
+      if (child !== proc) return;
+      child = null;
+      enabled = false;
+      if (timer) { clearInterval(timer); timer = null; }
+      reason = `起不来：${e?.code ?? e?.message ?? e}`;
+    });
+    proc.on('exit', (code) => {
+      // 优雅停止要等最多 1.5 秒：期间可能已经 start() 了新的一轮，旧进程的 exit 不许动新状态
+      if (child !== proc) return;
       const wasEnabled = enabled;
       child = null;
       enabled = false;
@@ -1045,6 +1079,7 @@ export function createListener({
       };
       child?.stdout?.on('data', onData);
       child?.once('exit', () => { clearTimeout(t); resolve(false); });
+      child?.once('error', () => { clearTimeout(t); resolve(false); });
     });
     if (!ok) {
       stop('回环设备没打开（没有可用的 WASAPI loopback？）');
@@ -1066,8 +1101,21 @@ export function createListener({
   function stop(why = null) {
     if (timer) { clearInterval(timer); timer = null; }
     if (child) {
-      try { child.kill(); } catch { /* 已经没了 */ }
+      const proc = child;
       child = null;
+      /**
+       * **先关 stdin，让 listen.py 自己走 finally**（交出没说完的半句、关 WASAPI 设备）。
+       * 直接 kill() 在 Windows 上是 TerminateProcess —— SIGTERM handler 永远不跑，
+       * 那半句话和设备清理一起丢。1.5 秒还不走再硬杀。
+       */
+      let hard = null;
+      try { proc.stdin?.end(); } catch { /* 已经关了 */ }
+      if (proc.exitCode === null && proc.signalCode === null) {
+        hard = setTimeout(() => { try { proc.kill(); } catch { /* 已经没了 */ } }, 1500);
+        hard.unref?.();
+        proc.once('exit', () => clearTimeout(hard));
+      }
+      if (!proc.stdin) { try { proc.kill(); } catch { /* 已经没了 */ } }
     }
     enabled = false;
     reason = why || '停了';

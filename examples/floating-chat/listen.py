@@ -49,6 +49,7 @@ import os
 import queue
 import signal
 import sys
+import threading
 import time
 import wave
 
@@ -371,6 +372,8 @@ def main():
     ap.add_argument("--live-min", type=float, default=1.8, help="说满这么多秒才给第一版临时字幕")
     ap.add_argument("--live-step", type=float, default=1.2, help="之后每这么多秒刷新一版")
     ap.add_argument("--list-devices", action="store_true", help="列出回环设备后退出")
+    ap.add_argument("--stop-on-eof", action="store_true",
+                    help="stdin 读到 EOF 就正常收工（上层关 stdin = 优雅停止）")
     args = ap.parse_args()
 
     if args.list_devices:
@@ -382,6 +385,21 @@ def main():
 
     # 上层是 SIGTERM 收工的：不接这个信号的话 finally 不会跑，正在说的那半句就丢了
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+    # **Windows 上没有 SIGTERM 这回事**：Node 的 `child.kill()` 是 TerminateProcess，
+    # 上面那个 handler 永远不会跑，finally 里的"交出半句 / 关设备"全丢。
+    # 所以上层改成先关 stdin：这里读到 EOF 就让主循环自己走到 finally。
+    # 必须显式开（--stop-on-eof）：stdin 是 /dev/null 时 read() 立刻 EOF，默认开会秒退。
+    stop_evt = threading.Event()
+    if args.stop_on_eof:
+        def _watch_stdin():
+            try:
+                while sys.stdin.buffer.read(4096):
+                    pass
+            except Exception:
+                pass
+            stop_evt.set()
+        threading.Thread(target=_watch_stdin, name="stdin-eof", daemon=True).start()
 
     p = pa.PyAudio()
     try:
@@ -458,7 +476,7 @@ def main():
                 emit({"event": "live", "at": round(t0, 3), "dur": round(len(audio) / SR, 2)})
 
         stream.start_stream()
-        while True:
+        while not stop_evt.is_set():
             try:
                 # 20ms 而不是 50：静音期没有数据块，`tick()` 的粒度就是这个超时 ——
                 # 它直接计进"说完 → 判定说完"的延迟里。

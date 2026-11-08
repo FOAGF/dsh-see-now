@@ -23,7 +23,10 @@
  */
 
 import { spawn, spawnSync } from 'node:child_process';
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync, closeSync, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync,
+  renameSync, statSync, unlinkSync, writeFileSync,
+} from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -36,6 +39,48 @@ const REL = join('examples', 'floating-chat', 'window.py');
 
 function readJson(p) {
   try { return JSON.parse(readFileSync(p, 'utf8')) ?? {}; } catch { return {}; }
+}
+
+/** Windows 上 rename 撞上"对面正开着这个文件"时报的几种码 —— 都是暂时的，等一下就好。 */
+const TRANSIENT_RENAME = new Set(['EPERM', 'EACCES', 'EBUSY']);
+
+function sleepSync(ms) {
+  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* 不支持就不等 */ }
+}
+
+/**
+ * 写 JSON：**tmp 再 rename**，Windows 上被占用时重试，最后退回直接覆盖。
+ *
+ * 为什么要重试：窗口进程每 250ms 用 `Path.read_text()` 读一次 `watch-window.json`，
+ * Python 的 `open()` 不带 `FILE_SHARE_DELETE` —— 那一瞬间 `MoveFileEx` 必然
+ * EPERM/EACCES；杀软和索引服务也会这样短暂占住文件。以前一次失败就放弃，
+ * 于是"让窗口显示出来"这条救命指令会偶发失败，还在目录里留一个 `.json.tmp`。
+ *
+ * 字节格式不变：`indent=2`、无尾随换行（和窗口那边的 `write_config` 逐字节一致）。
+ *
+ * @param {{rename?: typeof renameSync, retries?: number}} [o] — `rename` 可注入，测试用
+ */
+export function writeJsonAtomic(path, obj, { rename = renameSync, retries = 5 } = {}) {
+  const text = JSON.stringify(obj, null, 2);
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.tmp`;
+  writeFileSync(tmp, text, 'utf8');
+  let last = null;
+  for (let i = 0; i < retries; i += 1) {
+    try {
+      rename(tmp, path);
+      return;
+    } catch (e) {
+      last = e;
+      if (!TRANSIENT_RENAME.has(e?.code)) break;
+      sleepSync(20 * 2 ** i);
+    }
+  }
+  try { unlinkSync(tmp); } catch { /* 已经没了 */ }
+  // rename 一直被挡（对面只是在读）：直接覆盖写也能成，读的一方最多读到一次半截 JSON，
+  // 两边的 readJson 都兜了 —— 比"写失败"强。不是暂时性错误就照实抛。
+  if (!TRANSIENT_RENAME.has(last?.code)) throw last;
+  writeFileSync(path, text, 'utf8');
 }
 
 function seeConfig() {
@@ -134,10 +179,7 @@ export function setWindowStyle(style, { log = () => {}, env = process.env } = {}
   if (want === 'auto') delete cfg.glass;
   else cfg.glass = want;
   try {
-    mkdirSync(dirname(path), { recursive: true });
-    const tmp = `${path}.tmp`;
-    writeFileSync(tmp, JSON.stringify(cfg, null, 2), 'utf8');
-    renameSync(tmp, path);
+    writeJsonAtomic(path, cfg);
   } catch (e) {
     const error = String(e?.message ?? e);
     log(`写 ${path} 失败：${error}`);
@@ -201,10 +243,7 @@ export function setWindowHidden(hidden, { log = () => {}, env = process.env } = 
   if (want) cfg.hiddenBy = SESSION_ID;
   else delete cfg.hiddenBy;
   try {
-    mkdirSync(dirname(path), { recursive: true });
-    const tmp = `${path}.tmp`;
-    writeFileSync(tmp, JSON.stringify(cfg, null, 2), 'utf8');
-    renameSync(tmp, path);
+    writeJsonAtomic(path, cfg);
   } catch (e) {
     const error = String(e?.message ?? e);
     log(`写 ${path} 失败：${error}`);
@@ -234,10 +273,7 @@ export function setWindowDanmaku(on, { log = () => {}, env = process.env } = {})
   if ((cfg.danmaku === true) === want) return { ok: true, changed: false, danmaku: want };
   cfg.danmaku = want;
   try {
-    mkdirSync(dirname(path), { recursive: true });
-    const tmp = `${path}.tmp`;
-    writeFileSync(tmp, JSON.stringify(cfg, null, 2), 'utf8');
-    renameSync(tmp, path);
+    writeJsonAtomic(path, cfg);
   } catch (e) {
     const error = String(e?.message ?? e);
     log(`写 ${path} 失败：${error}`);
@@ -467,6 +503,36 @@ export function hasTkinter(python) {
  * 所以候选只留 PATH 和显式配置。Store 版用户请用 `DSH_SEE_PYTHON` 指向真实解释器
  * （`py -0p` 能列出来）。
  */
+let pyLauncherCache = null;
+
+/**
+ * Windows 的 **`py` 启动器**指向的真解释器：`[pythonw.exe?, python.exe]`（非 Windows 返回空）。
+ *
+ * python.org 的安装包默认**不勾**"Add to PATH"，PATH 上只有 `C:\Windows\py.exe` ——
+ * 只按 `pythonw.exe` / `python.exe` 找，这类用户永远是"没有能用的解释器"。
+ * 问一次 `py -3` 它的 `sys.executable` 是谁，把那个绝对路径（和同目录的 pythonw）补进候选。
+ * 进程内只问一次。
+ */
+export function pyLauncherPythons({
+  platform = process.platform,
+  run = null,
+} = {}) {
+  if (platform !== 'win32') return [];
+  if (!run && pyLauncherCache) return pyLauncherCache;
+  const exec = run ?? ((cmd, args) => spawnSync(cmd, args, { encoding: 'utf8', timeout: 5000, windowsHide: true }));
+  let out = [];
+  try {
+    const r = exec('py', ['-3', '-c', 'import sys; print(sys.executable)']);
+    const exe = r?.status === 0 ? String(r.stdout ?? '').trim().split(/\r?\n/).pop()?.trim() : '';
+    if (exe && /\.exe$/i.test(exe)) {
+      const w = join(dirname(exe), 'pythonw.exe');
+      out = [...(existsSync(w) ? [w] : []), exe];
+    }
+  } catch { out = []; }
+  if (!run) pyLauncherCache = out;
+  return out;
+}
+
 export function pythonCandidates() {
   const cfg = seeConfig();
   const list = [];
@@ -474,7 +540,7 @@ export function pythonCandidates() {
     if (c) list.push(c);
   }
   if (process.platform === 'win32') {
-    list.push('pythonw.exe', 'python.exe');
+    list.push('pythonw.exe', 'python.exe', ...pyLauncherPythons());
   } else {
     list.push('python3', 'python');
   }
@@ -538,6 +604,46 @@ export function windowPidAlive() {
 }
 
 /**
+ * 这个 pid 现在**还是不是我们的窗口进程**（杀之前必须问）。
+ *
+ * pid 文件在用户点 × 之后不会被删（窗口脚本不知道这个文件），而 Windows 的 pid
+ * 回收得很快：几小时后同一个号可能已经是浏览器 / 编辑器。`process.kill(pid)` 在
+ * Windows 上是**无条件 TerminateProcess** —— 不验身份，就是替用户杀掉一个无关进程。
+ *
+ * 判据只看"是不是 python"：窗口一定是我们用某个 python 解释器拉起来的。
+ * 查不到（tasklist / ps 不可用）一律当**不是** —— 宁可多留一个卡死的窗，也不误杀。
+ *
+ * @param {number} pid
+ * @param {{platform?: string, run?: (cmd:string, args:string[]) => {status:number|null, stdout?:string}}} [o]
+ *   `run` 可注入，测试用
+ */
+export function pidLooksLikeWindow(pid, {
+  platform = process.platform,
+  run = (cmd, args) => spawnSync(cmd, args, { encoding: 'utf8', timeout: 5000, windowsHide: true }),
+} = {}) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    if (platform === 'win32') {
+      // 输出形如 `"pythonw.exe","1234","Console","1","45,000 K"`；没这个进程时是一句 INFO
+      const r = run('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH']);
+      if (r?.status !== 0) return false;
+      for (const line of String(r.stdout ?? '').split(/\r?\n/)) {
+        const m = /^"([^"]+)","(\d+)"/.exec(line.trim());
+        if (m && Number(m[2]) === pid) return /^pythonw?[\d.]*\.exe$/i.test(m[1]);
+      }
+      return false;
+    }
+    // 只看**可执行文件名**（comm），不看整条命令行 —— 后者里随便一个参数带 "python" 就会误判
+    const r = run('ps', ['-o', 'comm=', '-p', String(pid)]);
+    if (r?.status !== 0) return false;
+    const exe = String(r.stdout ?? '').trim().split('/').pop();
+    return /^python/i.test(exe);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * 上次开的那个还活着吗？（**"这窗还能用吗"**，决定要不要重开）
  *
  * **不能只看 pid**：pid 会被系统复用，进程也可能活着但界面卡死、或者是一张全透明的空窗。
@@ -581,9 +687,10 @@ export async function openWindow({ force = false, log = () => {}, settleMs = 700
 
   // force、或者 pid 还在但心跳过期（进程卡死/是空窗）才会走到这儿：
   // 先把上一次那个进程收掉，否则会叠出两个窗口，而用户只看得见一个。
+  // **先验身份**：pid 可能早被系统回收给了别的程序（见 `pidLooksLikeWindow`）。
   try {
     const old = Number(readFileSync(pidPath(), 'utf8').trim());
-    if (Number.isInteger(old) && old > 0 && old !== process.pid) {
+    if (Number.isInteger(old) && old > 0 && old !== process.pid && pidLooksLikeWindow(old)) {
       try { process.kill(old); } catch { /* 已经没了 */ }
     }
   } catch { /* 没有 pid 文件，正常首次启动 */ }
@@ -608,12 +715,33 @@ export async function openWindow({ force = false, log = () => {}, settleMs = 700
     if (!probe.ok) { tried.push(`${python}（${probe.detail}）`); continue; }
 
     const useProtocol = Boolean(onCommand || signal);
+    /**
+     * 非协议模式：stderr **直接给日志文件的 fd**，不走管道。
+     *
+     * 窗口是 detached 的，活得比我们久（`npx dsh-see-window` 开完就 exit，DSH 也会重启）。
+     * 管道的读端一走，Python 再往 stderr 写（Tk 回调里的 Traceback）就是
+     * `OSError [Errno 22]`（Windows）/ `BrokenPipeError` —— 异常处理本身再抛异常，
+     * 轻则回调死掉，重则弹 Tcl 的 background error 框。
+     *
+     * `reason` 要的那段尾巴改成**从日志里读回来**：记下开跑前的文件长度，秒退时读增量。
+     */
+    let logFd = null;
+    let logStart = 0;
+    if (!useProtocol) {
+      try {
+        mkdirSync(dirname(logPath()), { recursive: true });
+        logFd = openSync(logPath(), 'a');
+        logStart = fstatSync(logFd).size;
+      } catch {
+        if (logFd !== null) { try { closeSync(logFd); } catch { /* 算了 */ } }
+        logFd = null;                    // 开不了日志：退回管道（老行为）
+      }
+    }
     let child;
     try {
       child = spawn(python, [script], {
-        // stderr 一律自己 pipe：既要照旧落进日志文件，也要留一份尾巴给 `reason`。
-        // 只给一个 log fd 的话，Node 侧永远拿不到那句 Traceback。
-        stdio: useProtocol ? ['pipe', 'pipe', 'pipe'] : ['ignore', 'ignore', 'pipe'],
+        // 协议模式我们自己管它的生命周期，stderr 照旧 pipe（日志 + 尾巴）
+        stdio: useProtocol ? ['pipe', 'pipe', 'pipe'] : ['ignore', 'ignore', logFd ?? 'pipe'],
         detached: true,
         windowsHide: true,
         env: {
@@ -627,9 +755,12 @@ export async function openWindow({ force = false, log = () => {}, settleMs = 700
         },
       });
     } catch (e) {
+      if (logFd !== null) { try { closeSync(logFd); } catch { /* 算了 */ } }
       tried.push(`${python}（spawn 失败：${e?.message ?? e}）`);
       continue;
     }
+    // 子进程已经继承了这个 fd，我们这边留着没用
+    if (logFd !== null) { try { closeSync(logFd); } catch { /* 算了 */ } }
 
     errTail = '';
     child.stderr?.on('data', (chunk) => {
@@ -663,6 +794,7 @@ export async function openWindow({ force = false, log = () => {}, settleMs = 700
     const dead = record ? await Promise.race([waitExit(child, settleMs), new Promise((resolve) => { record.ready = resolve; })]) : await waitExit(child, settleMs);
     if (dead) {
       await errClosed;
+      if (logFd !== null) errTail = readLogSince(logStart);
       // code=1 且是"立刻退出"：八成是缺包。探测一次，把包名带进错误信息。
       const miss = dead.code === 1 ? missingPkgs(python) : [];
       for (const m of miss) missing.add(m);
@@ -714,6 +846,24 @@ function missingPkgs(python) {
   } catch { return []; }
 }
 
+/** 日志文件从 `start` 字节起新增的内容（最多尾部 4000 字节）。读不到就空串。 */
+function readLogSince(start) {
+  let fd = null;
+  try {
+    fd = openSync(logPath(), 'r');
+    const size = fstatSync(fd).size;
+    const from = Math.max(start, size - 4000);
+    if (size <= from) return '';
+    const buf = Buffer.alloc(size - from);
+    readSync(fd, buf, 0, buf.length, from);
+    return buf.toString('utf8');
+  } catch {
+    return '';
+  } finally {
+    if (fd !== null) { try { closeSync(fd); } catch { /* 算了 */ } }
+  }
+}
+
 /** 等最多 `ms`；进程先退出就返回 {code}，否则返回 null（还活着）。 */
 function waitExit(child, ms) {
   return new Promise((resolve) => {
@@ -736,7 +886,8 @@ export function closeWindow() {
   }
   try {
     const pid = Number(readFileSync(pidPath(), 'utf8').trim());
-    if (Number.isInteger(pid) && pid > 0) process.kill(pid);
+    // pid 文件可能是陈年的（用户点 × 关的窗不删它），号早被回收了：不是 python 就不杀
+    if (Number.isInteger(pid) && pid > 0 && pid !== process.pid && pidLooksLikeWindow(pid)) process.kill(pid);
   } catch { /* 已经没了 */ }
   try { unlinkSync(pidPath()); } catch { /* 本来就没有 */ }
 }

@@ -8,6 +8,9 @@ import { join } from 'node:path';
 process.env.DSH_HOME = mkdtempSync(join(tmpdir(), 'dsh-file-playback-'));
 process.env.DSH_SEE_NO_WINDOW = '1';
 
+const { FFMPEG } = await import('./ffmpeg.mjs');
+// 和其它测试同一套解析（DSH_FFMPEG_PATH / bundled / PATH）：裸 'ffmpeg' 在 Windows CI 上未必在 PATH
+const FF = FFMPEG ?? 'ffmpeg';
 const { sourceArgs, spawnFrames } = await import('../src/capture.js');
 const { createRunner } = await import('../src/runner.js');
 
@@ -15,7 +18,7 @@ const FIXTURE = join(process.env.DSH_HOME, 'clip.mp4');
 
 function makeFixture() {
   if (existsSync(FIXTURE) && statSync(FIXTURE).size > 10_000) return FIXTURE;
-  execFileSync('ffmpeg', ['-hide_banner', '-v', 'error', '-y',
+  execFileSync(FF, ['-hide_banner', '-v', 'error', '-y',
     '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=12', '-t', '20',
     '-pix_fmt', 'yuv420p', '-c:v', 'libx264', '-preset', 'ultrafast', FIXTURE],
   { stdio: 'inherit' });
@@ -31,7 +34,7 @@ test('seek 之后第一帧的时间戳带上起点（否则台词和画面对不
   const frames = [];
   const run = spawnFrames({
     source: { kind: 'file', path: makeFixture() },
-    width: 320, height: 180, fps: 12,
+    width: 320, height: 180, fps: 12, ffmpegPath: FF,
     onFrame: (f) => { frames.push(f); },
   });
   await new Promise((resolve) => { run.done.then(resolve).catch(resolve); });
@@ -41,7 +44,7 @@ test('seek 之后第一帧的时间戳带上起点（否则台词和画面对不
   const seeked = [];
   const run2 = spawnFrames({
     source: { kind: 'file', path: makeFixture(), seek: 10 },
-    width: 320, height: 180, fps: 12,
+    width: 320, height: 180, fps: 12, ffmpegPath: FF,
     onFrame: (f) => { seeked.push(f); },
   });
   await new Promise((resolve) => { run2.done.then(resolve).catch(resolve); });
@@ -56,7 +59,7 @@ test('pause 之后不再收到新帧，resume 之后恢复', async () => {
   // 400ms 内整段就放完了，"暂停"根本测不到。
   const run = spawnFrames({
     source: { kind: 'file', path: clip, realtime: true },
-    width: 320, height: 180, fps: 12,
+    width: 320, height: 180, fps: 12, ffmpegPath: FF,
     onFrame: (f) => { frames.push(f.t); },
   });
   await new Promise((resolve) => setTimeout(resolve, 400));
